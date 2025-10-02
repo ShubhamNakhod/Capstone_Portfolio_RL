@@ -2,9 +2,9 @@ import pandas as pd
 from azure.storage.filedatalake import DataLakeFileClient
 
 # --- credential ---
-CONNECTION_STRING = "your_connection_string_goes_here"
-FILE_SYSTEM_NAME = "name_of_the_file_system_or_container"
-FILE_PATH = "path/to/your/datafile.csv" 
+CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=capstonefall2025;AccountKey=....;EndpointSuffix=core.windows.net"
+FILE_SYSTEM_NAME = "gold"
+FILE_PATH = "data.csv"   # or "foldername/data.csv" if inside a folder 
 #----------------------------------------------------
 
 try:
