@@ -1,10 +1,15 @@
 import pandas as pd
 from azure.storage.filedatalake import DataLakeFileClient
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- credential ---
-CONNECTION_STRING = "your_connection_string_goes_here"
-FILE_SYSTEM_NAME = "name_of_the_file_system_or_container"
-FILE_PATH = "path/to/your/datafile.csv" 
+CONNECTION_STRING = os.getenv('AZURE_CONNECTION_STRING')
+FILE_SYSTEM_NAME = os.getenv('AZURE_FILE_SYSTEM_NAME')
+FILE_PATH = os.getenv('AZURE_FILE_PATH') 
 #----------------------------------------------------
 
 try:
