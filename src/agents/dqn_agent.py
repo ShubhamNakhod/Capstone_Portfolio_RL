@@ -79,6 +79,10 @@ class DQNAgent(BaseAgent):
         self.episode_reward = 0
         self.episode_length = 0
         
+        # Temporary storage for episode (will be cleared each episode)
+        self.states = []
+        self.actions = []
+        
         # Action mapping for portfolio strategies
         self.action_strategies = self._create_action_strategies()
     
@@ -159,31 +163,42 @@ class DQNAgent(BaseAgent):
         # Store for training
         if training:
             self.states.append(state)
-            self.actions.append(action_idx)
+            self.actions.append(action_idx)  # Store action index
             self.episode_reward += 0  # Will be updated when reward is received
             self.episode_length += 1
+            # Store the selected action index for later use
+            self.last_action_idx = action_idx
         
         return portfolio_weights
     
-    def store_experience(self, state: np.ndarray, action: int, reward: float, 
+    def store_experience(self, state: np.ndarray, action, reward: float, 
                         next_state: np.ndarray, done: bool):
         """
         Store experience in the replay buffer.
         
         Args:
             state: Current state
-            action: Action taken (index)
+            action: Action taken (ignored, uses stored action index)
             reward: Reward received
             next_state: Next state
             done: Whether episode is done
         """
-        self.replay_buffer.add(state, np.array([action]), reward, next_state, done)
+        # Use the stored action index instead of the passed action
+        # The 'action' parameter in training is actually the portfolio weights array,
+        # but we need the discrete action index
+        action_idx = getattr(self, 'last_action_idx', 0)
+        action_array = np.array([action_idx])
+        
+        self.replay_buffer.add(state, action_array, reward, next_state, done)
         
         if done:
             self.training_metrics['episode_rewards'].append(self.episode_reward)
             self.training_metrics['episode_lengths'].append(self.episode_length)
             self.episode_reward = 0
             self.episode_length = 0
+            # Clear episode storage
+            self.states = []
+            self.actions = []
     
     def update(self, batch: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, float]:
         """

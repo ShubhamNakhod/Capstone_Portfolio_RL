@@ -405,16 +405,37 @@ class EnhancedPortfolioEnv(BasePortfolioEnv):
             corr_features = self.correlation_features[self.current_step]
             corr_idx = 0
             
+            # Ensure we don't exceed bounds
+            n_stocks_in_action = len(new_weights)
+            n_stocks_in_env = len(self.stock_names)
+            
             for i, stock1 in enumerate(self.stock_names):
                 for j, stock2 in enumerate(self.stock_names):
                     if i < j:  # Only upper triangular part
-                        corr = corr_features[corr_idx]
-                        if abs(corr) > 0.7:  # High correlation threshold from EDA
-                            correlation_penalty += new_weights[i] * new_weights[j] * abs(corr) * 0.1
+                        # Check bounds to prevent index errors
+                        if i < n_stocks_in_action and j < n_stocks_in_action:
+                            corr = corr_features[corr_idx]
+                            if abs(corr) > 0.7:  # High correlation threshold from EDA
+                                correlation_penalty += new_weights[i] * new_weights[j] * abs(corr) * 0.1
                         corr_idx += 1
         
         # Store penalties for reward calculation
         self.last_correlation_penalty = correlation_penalty
+        
+        # Handle dimension mismatch between new_weights and portfolio_weights
+        # This can happen when action_dim doesn't match n_stocks (e.g., DQN with discrete strategies)
+        if len(new_weights) != len(self.portfolio_weights):
+            # If dimensions don't match, pad or truncate new_weights to match
+            if len(new_weights) < len(self.portfolio_weights):
+                # Pad with zeros
+                padded_weights = np.pad(new_weights, (0, len(self.portfolio_weights) - len(new_weights)))
+            else:
+                # Truncate
+                padded_weights = new_weights[:len(self.portfolio_weights)]
+            
+            # Renormalize
+            padded_weights = padded_weights / np.sum(padded_weights) if np.sum(padded_weights) > 0 else self.portfolio_weights
+            new_weights = padded_weights
         
         # Calculate transaction costs
         weight_change = np.sum(np.abs(new_weights - self.portfolio_weights))

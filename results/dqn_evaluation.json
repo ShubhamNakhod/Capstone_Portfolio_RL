@@ -1,0 +1,9 @@
+{
+  "mean_reward": 1.1659795079746003,
+  "std_reward": 2.220446049250313e-16,
+  "mean_return": 0.06626155129233414,
+  "std_return": 1.3877787807814457e-17,
+  "mean_length": 232.0,
+  "std_length": 0.0,
+  "n_episodes": 50
+}
