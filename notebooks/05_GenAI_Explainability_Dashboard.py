@@ -1,353 +1,515 @@
 # 05_GenAI_Explainability_Dashboard.py
-# -------------------------------------------------------------------------
-# Streamlit dashboard for a hybrid GenAI + RL investing assistant.
-# Combines local RL agent intelligence with real-time market data,
-# human-like reasoning, and explainable recommendations.
-# -------------------------------------------------------------------------
+# Smart Portfolio Allocator — RL + GenAI Dashboard
+# Streamlit app with four tabs: Chat, Data Explorer, RL Insights, Stock Intelligence
 
 from __future__ import annotations
-import os, math, textwrap, re
+
+import os
+import sys
+import json
+import time
+import math
+import textwrap
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
 
-# Internet data
+# -----------------------------
+# Optional vendors (handled safely)
+# -----------------------------
 try:
     import yfinance as yf
-    YF_OK = True
-except Exception:
-    YF_OK = False
+except Exception:  # if yfinance not installed yet
+    yf = None
 
-# Local imports
-_dl_ok = False
-_agents_ok = False
-try:
-    from data_loader import load_and_prepare_data
-    _dl_ok = True
-except Exception:
-    try:
-        from src.data.data_loader import load_and_prepare_data
-        _dl_ok = True
-    except Exception:
-        pass
-
-try:
-    from ppo_agent import PPOAgent
-    from dqn_agent import DQNAgent
-    _agents_ok = True
-except Exception:
-    try:
-        from src.agents.ppo_agent import PPOAgent
-        from src.agents.dqn_agent import DQNAgent
-        _agents_ok = True
-    except Exception:
-        pass
-
-# OpenAI setup
-_openai_ready = False
-_openai_mode = None
 try:
     from openai import OpenAI
-    if os.getenv("OPENAI_API_KEY"):
-        _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        _openai_ready = True
-        _openai_mode = "client_v1"
 except Exception:
-    try:
-        import openai
-        if os.getenv("OPENAI_API_KEY"):
-            openai.api_key = os.getenv("OPENAI_API_KEY")
-            _openai_ready = True
-            _openai_mode = "legacy"
-    except Exception:
-        _openai_ready = False
+    OpenAI = None  # LLM is optional; we provide an offline fallback
 
-# Streamlit UI
-st.set_page_config(page_title="GenAI Explainability Dashboard", layout="wide")
+# Make project root importable so "src.agents" works when launched from /notebooks
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
-with st.sidebar:
-    st.title("GenAI + RL Trading Assistant")
-    agent_choice = st.selectbox("Select RL Agent", ["PPO", "DQN"], index=0)
-    data_mode = st.selectbox("Data Source", ["Local CSVs", "Internet (yfinance)"], index=0)
-    data_dir = st.text_input("Local data directory", value=str(Path.cwd()))
-    ppo_ckpt = st.text_input("PPO checkpoint", value="ppo_agent.pth")
-    dqn_ckpt = st.text_input("DQN checkpoint", value="dqn_agent.pth")
+# -----------------------------
+# Attempt to import RL agents (safe)
+# -----------------------------
+PPOAgent = None
+DQNAgent = None
 
-    st.divider()
-    st.text("Investment Profile")
-    init_capital = st.number_input("Capital (USD)", min_value=1000, value=10000, step=1000)
-    risk_tolerance = st.select_slider("Risk tolerance", ["low", "medium", "high"], value="medium")
-    horizon_years = st.slider("Investment horizon (years)", 1, 10, 3)
-    need_income = st.checkbox("I need regular income (dividends)", value=False)
-    st.caption("Tabs below: Chat | Data Explorer | RL Insights")
+def _try_import_agents() -> Tuple[Optional[type], Optional[type], Optional[str]]:
+    """
+    Try multiple import paths for PPO/DQN agents. Return (PPOAgent, DQNAgent, err_msg)
+    without throwing import errors into the UI.
+    """
+    try_paths = [
+        "src.agents.ppo_agent",
+        "agents.ppo_agent",
+    ]
+    err = None
+    ppo_cls = None
+    dqn_cls = None
+    for mod in try_paths:
+        try:
+            p = __import__(mod, fromlist=["PPOAgent"])
+            ppo_cls = getattr(p, "PPOAgent", None)
+            if ppo_cls:
+                break
+        except Exception as e:
+            err = str(e)
 
-# Session state
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "prices_df" not in st.session_state:
-    st.session_state.prices_df = None
-if "returns_df" not in st.session_state:
-    st.session_state.returns_df = None
+    try_paths = [
+        "src.agents.dqn_agent",
+        "agents.dqn_agent",
+    ]
+    for mod in try_paths:
+        try:
+            d = __import__(mod, fromlist=["DQNAgent"])
+            dqn_cls = getattr(d, "DQNAgent", None)
+            if dqn_cls:
+                break
+        except Exception as e:
+            err = str(e)
 
-# Helper functions ----------------------------------------------------------
-def _human_reply(text: str) -> str:
-    t = text.strip().lower()
-    if any(x in t for x in ["hello", "hi", "hey", "yo"]):
-        return "Hello. How can I help with markets or your portfolio today?"
-    if t.endswith("?"):
-        return "Good question. Let’s reason through it using your market data."
-    return "Got it. Let’s analyze this step by step."
+    return ppo_cls, dqn_cls, err
 
-def fetch_internet_prices(tickers: List[str], period: str = "6mo") -> Optional[pd.DataFrame]:
-    if not YF_OK:
-        st.warning("yfinance not installed.")
+
+PPOAgent, DQNAgent, _AGENT_IMPORT_ERR = _try_import_agents()
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+@st.cache_data(show_spinner=False)
+def _normalize_tickers(raw: str) -> List[str]:
+    tks = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    # remove duplicates while preserving order
+    seen = set()
+    out = []
+    for t in tks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _safe_col(series: pd.Series | pd.DataFrame, name: str) -> pd.Series:
+    """
+    Ensure we return a 1-D float series. If a DF comes in, take the first column.
+    """
+    if isinstance(series, pd.DataFrame):
+        if series.shape[1] == 0:
+            raise ValueError("Empty DataFrame passed for column selection.")
+        series = series.iloc[:, 0]
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    s.name = name
+    return s
+
+
+@st.cache_data(show_spinner=False)
+def fetch_from_yf(ticker: str, period: str = "1y") -> Optional[pd.Series]:
+    """
+    Fetch adjusted close from Yahoo Finance with fallbacks.
+    Returns a price Series indexed by DatetimeIndex, named as ticker.
+    """
+    if yf is None:
         return None
     try:
-        data = yf.download(tickers, period=period, auto_adjust=True, progress=False)
-        if "Close" in data.columns:
-            close = data["Close"].copy()
-            close.columns = [c if isinstance(c, str) else c[1] for c in close.columns]
-            return close.dropna(how="all")
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        # Prefer auto_adjust=True to get 'Close' already adjusted
+        df = yf.download(
+            tickers=ticker,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if df is None or df.empty:
+            return None
+
+        # With auto_adjust=True, 'Close' is adjusted and is present for single ticker
+        if "Close" in df.columns:
+            s = _safe_col(df["Close"], ticker)
+            return s.dropna()
+
+        # If multi-index (unlikely for single ticker) – fallback
+        if isinstance(df.columns, pd.MultiIndex):
+            # Try ('Close', ticker) or (ticker, 'Close')
+            try_keys = [( "Close", ticker), (ticker, "Close") ]
+            for key in try_keys:
+                if key in df.columns:
+                    return _safe_col(df[key], ticker).dropna()
+        return None
+    except Exception:
+        return None
+
+
+def _read_local_csv_one(data_dir: Path, ticker: str) -> Optional[pd.Series]:
+    """
+    Try reading a local CSV named like '{ticker}.csv' or any CSV that has a 'Close'/'Adj Close' column.
+    """
+    data_dir = Path(data_dir)
+    candidates = []
+    # Exact-name first if present
+    exact = data_dir / f"{ticker}.csv"
+    if exact.exists():
+        candidates.append(exact)
+    # General fallback: any csv containing ticker in name
+    candidates.extend(sorted(data_dir.glob(f"*{ticker}*.csv")))
+
+    for fp in candidates:
+        try:
+            df = pd.read_csv(fp)
+            # Try common date columns
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                df = df.set_index("Date").sort_index()
+            elif df.columns[0].lower() in ("date", "time", "timestamp"):
+                df[df.columns[0]] = pd.to_datetime(df[df.columns[0]], errors="coerce")
+                df = df.set_index(df.columns[0]).sort_index()
+            else:
+                # try to parse first column as date
+                df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+                df = df.set_index(df.columns[0]).sort_index()
+
+            for c in ["Adj Close", "Close", "close", "adj_close", "Price", "price"]:
+                if c in df.columns:
+                    return _safe_col(df[c], ticker).dropna()
+            # uncommon: price might be the only numeric column
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) >= 1:
+                return _safe_col(df[numeric_cols[0]], ticker).dropna()
+        except Exception:
+            continue
     return None
 
-def suggest_allocation(returns_df: pd.DataFrame, risk: str, need_income: bool, capital: float):
-    if returns_df is None or returns_df.empty:
-        return pd.Series(dtype=float), pd.DataFrame()
-    mu = returns_df.mean() * 252
-    cov = returns_df.cov() * 252
-    target_vol = {"low": 0.10, "medium": 0.18, "high": 0.28}[risk]
-    cov_reg = cov + 0.5 * np.eye(cov.shape[0])
-    inv = np.linalg.pinv(cov_reg.values)
-    raw = np.maximum(inv @ mu.values, 0)
-    w = raw / raw.sum()
-    vol = math.sqrt(float(w @ cov.values @ w))
-    w = w * min(1.0, target_vol / (vol + 1e-9))
-    w = w / w.sum()
-    weights = pd.Series(w, index=returns_df.columns)
-    if need_income:
-        for i in weights.index:
-            if any(x in i for x in ["JNJ", "KO", "PG", "UNH"]):
-                weights[i] *= 1.15
-        weights /= weights.sum()
-    alloc = (weights * capital).round(2)
-    table = pd.DataFrame({"Weight %": (weights * 100).round(2), "Allocation ($)": alloc})
-    return weights, table
 
-def run_backtest(prices_df: pd.DataFrame, weights: pd.Series):
-    if prices_df is None or weights is None or weights.empty:
-        return pd.DataFrame()
-    common = [c for c in weights.index if c in prices_df.columns]
-    rets = prices_df[common].pct_change().dropna()
-    port = (rets @ weights[common]).to_frame("Return")
-    port["Cumulative"] = (1 + port["Return"]).cumprod()
-    return port
+@st.cache_data(show_spinner=False)
+def load_prices_hybrid(tickers: List[str], data_dir: str, period: str = "1y") -> pd.DataFrame:
+    """
+    For each ticker, load from local CSV if available; otherwise fetch from Yahoo.
+    Returns a simple DataFrame with columns = tickers (no MultiIndex),
+    index as datetime, float values.
+    """
+    data_dir = Path(data_dir) if data_dir else Path(".")
+    cols = {}
+    missing = []
 
-# Tabs ----------------------------------------------------------------------
-chat_tab, data_tab, rl_tab = st.tabs(["Chat", "Data Explorer", "RL Insights"])
+    for tk in tickers:
+        s_local = None
+        if data_dir.exists():
+            s_local = _read_local_csv_one(data_dir, tk)
+        if s_local is not None and not s_local.empty:
+            cols[tk] = s_local.astype(float)
+            continue
 
-# CHAT TAB ------------------------------------------------------------------
-with chat_tab:
-    st.subheader("AI Investing Copilot")
-    st.caption("Ask anything — e.g., 'is AAPL a buy today' or 'allocate 10000 USD for me'.")
+        s_web = fetch_from_yf(tk, period=period)
+        if s_web is not None and not s_web.empty:
+            cols[tk] = s_web.astype(float)
+            continue
 
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        missing.append(tk)
 
-    user_msg = st.chat_input("Type your message…")
+    if not cols:
+        raise ValueError("No valid data loaded for given tickers.")
 
-    # --- CSS fix to keep input pinned at bottom ---
+    df = pd.concat(cols.values(), axis=1)
+    df.columns = list(cols.keys())
+    df = df.sort_index().dropna(how="all")
+    if df.empty:
+        raise ValueError("Data loaded but empty after cleaning.")
+    return df
+
+
+def compute_basic_indicators(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    Compute daily returns, 20/50 SMA, and a simple RSI(14) for each column.
+    """
+    rets = df.pct_change().dropna()
+
+    sma20 = df.rolling(20).mean()
+    sma50 = df.rolling(50).mean()
+
+    # RSI
+    delta = df.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    RS = roll_up / (roll_down + 1e-9)
+    RSI = 100.0 - (100.0 / (1.0 + RS))
+
+    return {
+        "returns": rets,
+        "sma20": sma20,
+        "sma50": sma50,
+        "rsi14": RSI,
+    }
+
+
+def naive_forecast_series(s: pd.Series, horizon: int = 30) -> Tuple[float, float]:
+    """
+    Very simple 'forecast': last price +/- 1 std of last 60 returns scaled by sqrt(horizon).
+    Returns (low, high). If insufficient data, returns last price bounds of ±2%.
+    """
+    s = s.dropna()
+    if len(s) < 10:
+        p = float(s.iloc[-1])
+        return p * 0.98, p * 1.02
+    last_price = float(s.iloc[-1])
+    rets = s.pct_change().dropna().tail(60)
+    if rets.empty:
+        return last_price * 0.98, last_price * 1.02
+    vol = float(rets.std())
+    band = last_price * vol * math.sqrt(max(horizon, 1))
+    return last_price - band, last_price + band
+
+
+def _fmt_money(x: float, cur: str = "$") -> str:
+    try:
+        return f"{cur}{x:,.2f}"
+    except Exception:
+        return str(x)
+
+
+# ============================================================================
+# UI — Sidebar
+# ============================================================================
+st.set_page_config(page_title="GenAI + RL Assistant", layout="wide")
+st.sidebar.title("GenAI + RL Assistant")
+
+rl_agent_choice = st.sidebar.selectbox("RL Agent", ["PPO", "DQN"], index=0)
+data_source = st.sidebar.selectbox(
+    "Data Source",
+    ["Internet (yfinance)"],  # placeholder for future sources
+    index=0,
+)
+local_dir = st.sidebar.text_input(
+    "Local data directory",
+    value=str(Path.home() / "Downloads"),
+    help="Used for CSV fallbacks; put your local .csv files here if desired.",
+)
+
+st.sidebar.markdown("**RL Checkpoints**")
+ppo_ckpt = st.sidebar.text_input("ppo_agent.pth", value="ppo_agent.pth")
+dqn_ckpt = st.sidebar.text_input("dqn_agent.pth", value="dqn_agent.pth")
+
+# ============================================================================
+# Tabs
+# ============================================================================
+tabs = st.tabs(["Chat", "Data Explorer", "RL Insights", "Stock Intelligence"])
+
+# =============================================================================
+# TAB 1 — AI Investing Copilot (Capstone-aligned)
+# =============================================================================
+with tabs[0]:
+    st.header("AI Investing Copilot")
     st.markdown(
         """
-        <style>
-        [data-testid="stChatInput"] {
-            position: fixed;
-            bottom: 1rem;
-            width: 85%;
-            left: 7%;
-            z-index: 999;
-            background-color: #111;
-        }
-        [data-testid="stChatMessageInputContainer"] {
-            background: #111 !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
+        Ask portfolio-related questions such as:
+        - "Explain why PPO chose AAPL over MSFT"
+        - "Compare PPO vs DQN performance this week"
+        - "How should I allocate $50,000 now?"
+        """
     )
 
-    if user_msg:
-        st.session_state.chat_history.append({"role": "user", "content": user_msg})
+    user_query = st.text_input("Enter your message", key="chat_q")
 
-        # Detect tickers carefully (ignore normal words)
-        tickers = [t for t in re.findall(r"\b[A-Z]{1,5}\b", user_msg.upper()) 
-                   if t not in ["HELLO", "THANKS", "HEY", "HI", "BYE", "OK"]]
+    if st.button("Analyze", key="chat_btn"):
+        if not user_query.strip():
+            st.warning("Please enter a query first.")
+        else:
+            st.write(f"**User:** {user_query}")
 
-        context_lines = [
-            f"Agent: {agent_choice}, Risk: {risk_tolerance}, Horizon: {horizon_years}y, Capital: {init_capital}, Income: {need_income}"
-        ]
+            # Basic intent detection
+            qlow = user_query.lower()
+            wants_rl = any(w in qlow for w in ["ppo", "dqn", "agent", "policy", "q-network", "sharpe"])
 
-        px_df = None
-        if tickers and YF_OK:
+            # Try to load agents and provide simple metrics if available
+            rl_summary = {}
             try:
-                px_df = yf.download(tickers, period="6mo", auto_adjust=True, progress=False)["Close"]
-                changes = px_df.pct_change(5).iloc[-1].sort_values(ascending=False)
-                rsis = {}
-                for t in px_df.columns:
-                    ret = px_df[t].pct_change()
-                    gain = ret.where(ret > 0, 0.0)
-                    loss = -ret.where(ret < 0, 0.0)
-                    rs = gain.rolling(14).mean() / (loss.rolling(14).mean() + 1e-9)
-                    rsi = 100 - (100 / (1 + rs))
-                    rsis[t] = round(float(rsi.iloc[-1]), 2)
-                context_lines.append("5-day returns:\n" + changes.to_string())
-                context_lines.append("RSI(14):\n" + pd.Series(rsis).to_string())
+                if wants_rl and (PPOAgent or DQNAgent):
+                    # Minimal "fake" setup for metric illustration.
+                    # In your capstone, replace these with real evaluation metrics.
+                    rl_summary = {
+                        "ppo": {"avg_reward_30d": 0.054, "sharpe": 1.22},
+                        "dqn": {"avg_reward_30d": 0.041, "sharpe": 1.08},
+                        "note": "Replace with real logs/metrics from your training runs.",
+                    }
+                    st.json(rl_summary)
+                elif wants_rl and not (PPOAgent or DQNAgent):
+                    st.info("PPO/DQN Python modules not importable yet. RL insights limited to reasoning layer.")
             except Exception as e:
-                context_lines.append(f"(Failed to fetch live data: {e})")
+                st.info(f"RL metrics unavailable: {e}")
 
-        # Local data snapshot
-        if st.session_state.prices_df is not None:
-            last = st.session_state.prices_df.ffill().iloc[-1].dropna()
-            context_lines.append("Local price snapshot:\n" + last.head(5).to_string())
-
-        context = "\n\n".join(context_lines)
-
-        system_prompt = textwrap.dedent("""
-            You are a portfolio strategist and AI investment advisor.
-            Use numeric data (returns, RSI) to identify momentum or overbought/oversold signals.
-            Rules:
-              - RSI < 30 → oversold → bullish
-              - RSI > 70 → overbought → bearish
-            Give short, specific insights with reasoning, not generic advice.
-            Suggest tickers to buy/sell/hold with approximate weights that fit user's risk level.
-        """)
-
-        assistant_text = None
-        try:
-            if _openai_ready:
-                with st.spinner("Analyzing markets..."):
-                    if _openai_mode == "client_v1":
-                        resp = _openai_client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": f"User: {user_msg}\n\nContext:\n{context}"},
-                            ],
-                            temperature=0.2,
-                            timeout=15,
-                        )
-                        assistant_text = resp.choices[0].message.content.strip()
-                    else:
-                        resp = openai.ChatCompletion.create(
-                            model="gpt-4o-mini",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": f"User: {user_msg}\n\nContext:\n{context}"},
-                            ],
-                            temperature=0.2,
-                            request_timeout=15,
-                        )
-                        assistant_text = resp["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            st.warning(f"LLM unavailable: {e}")
-            assistant_text = None
-
-        if not assistant_text:
-            assistant_text = _human_reply(user_msg)
-
-        st.session_state.chat_history.append({"role": "assistant", "content": assistant_text})
-        with st.chat_message("assistant"):
-            st.markdown(assistant_text)
-
-        if px_df is not None:
-            fig = go.Figure()
-            for t in px_df.columns:
-                fig.add_trace(go.Scatter(x=px_df.index, y=px_df[t], name=t))
-            fig.update_layout(title="Recent Price Trend", height=350)
-            st.plotly_chart(fig, use_container_width=True)
-
-# DATA EXPLORER -------------------------------------------------------------
-with data_tab:
-    st.subheader("Data Explorer")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("Load Local Data"):
-            try:
-                prices, returns, _ = load_and_prepare_data(data_dir)
-                st.session_state.prices_df = prices
-                st.session_state.returns_df = returns
-                st.success(f"Loaded {prices.shape[1]} tickers.")
-            except Exception as e:
-                st.error(f"Local data load failed: {e}")
-
-        prices = st.session_state.prices_df
-        if prices is not None:
-            picks = st.multiselect("Select tickers", list(prices.columns), default=list(prices.columns)[:4])
-            if picks:
-                fig = go.Figure()
-                for t in picks:
-                    fig.add_trace(go.Scatter(x=prices.index, y=prices[t], name=t))
-                fig.update_layout(height=400, title="Local Price History")
-                st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        if YF_OK:
-            tickers_input = st.text_input("Tickers (comma-separated)", "AAPL,MSFT,AMZN,SPY")
-            if st.button("Fetch Internet Data"):
-                tickers = [x.strip().upper() for x in tickers_input.split(",") if x]
-                df = fetch_internet_prices(tickers)
-                if df is not None:
-                    st.session_state.prices_df = df
-                    st.session_state.returns_df = df.pct_change().dropna()
-                    st.success("Fetched market data.")
-                    st.line_chart(df)
-
-# RL INSIGHTS ---------------------------------------------------------------
-with rl_tab:
-    st.subheader("RL Insights")
-    if not _agents_ok:
-        st.warning("RL agents not found. Ensure ppo_agent.py and dqn_agent.py exist.")
-    else:
-        prices = st.session_state.prices_df
-        returns = st.session_state.returns_df
-        if prices is not None and returns is not None:
-            if agent_choice == "PPO":
-                agent = PPOAgent(state_dim=returns.shape[1]*20, action_dim=returns.shape[1])
-                ckpt = ppo_ckpt
-            else:
-                agent = DQNAgent(state_dim=returns.shape[1]*20, action_dim=5)
-                ckpt = dqn_ckpt
-
-            if Path(ckpt).exists():
+            # LLM reasoning layer
+            response_text = ""
+            if OpenAI is not None and os.getenv("OPENAI_API_KEY"):
                 try:
-                    agent.load(ckpt)
-                    st.success(f"Loaded checkpoint: {ckpt}")
+                    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                    prompt = f"""
+                    You are FinGPT — a reasoning engine inside a reinforcement learning portfolio dashboard.
+                    The user asked: {user_query}
+                    RL analysis output (if any): {json.dumps(rl_summary)}
+                    Provide a clear, concise explanation grounded in risk-reward logic and portfolio construction.
+                    """
+                    resp = client.chat.completions.create(
+                        model="gpt-5",
+                        messages=[
+                            {"role": "system", "content": "You are FinGPT, a financial analyst AI that interprets RL-driven portfolio allocations."},
+                            {"role": "user", "content": textwrap.dedent(prompt)},
+                        ],
+                        temperature=0.4,
+                        max_tokens=450,
+                    )
+                    response_text = resp.choices[0].message.content.strip()
                 except Exception as e:
-                    st.warning(f"Failed to load checkpoint: {e}")
+                    response_text = f"LLM disabled or failed: {e}. Here is a structured, non-LLM answer:\n"
             else:
-                st.info("No checkpoint found — using random weights.")
+                response_text = "LLM is not configured. Presenting a rule-based explanation.\n"
 
-            state = returns.tail(20).values.flatten()
-            action = agent.select_action(state, training=False)
-            if agent_choice == "DQN":
-                action = np.ones(returns.shape[1]) / returns.shape[1]
-            else:
-                action = np.maximum(action, 0)
-                action = action / action.sum()
+            if not response_text:
+                response_text = "No reasoning generated."
 
-            out = pd.DataFrame({"Ticker": returns.columns, "Weight %": (action * 100).round(2)})
-            st.dataframe(out)
+            # Simple rule-based fallback if LLM not available
+            if "LLM is not configured" in response_text or response_text.startswith("LLM disabled"):
+                if wants_rl:
+                    response_text += (
+                        "\n• PPO typically outputs continuous weights and tends to be smoother in allocation updates.\n"
+                        "• DQN uses discrete actions (e.g., strategy buckets) and may react more abruptly.\n"
+                        "• If average rewards and Sharpe are higher for PPO in your recent backtests, prefer PPO allocations.\n"
+                        "• In volatile periods, reduce weights to high-beta assets and rebalance more frequently."
+                    )
+                else:
+                    response_text += (
+                        "\n• For general market questions, combine recent price trend, realized volatility, and macro signals.\n"
+                        "• Use a simple momentum + mean-reversion blend to form a baseline view while you evaluate RL outputs."
+                    )
 
-            bt = run_backtest(prices, pd.Series(action, index=returns.columns))
-            if not bt.empty:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=bt.index, y=bt["Cumulative"], name="Portfolio"))
-                fig.update_layout(height=350, title="Backtest Performance")
-                st.plotly_chart(fig, use_container_width=True)
+            st.markdown(f"**FinGPT:**\n\n{response_text}")
+
+# =============================================================================
+# TAB 2 — Data Explorer
+# =============================================================================
+with tabs[1]:
+    st.header("Data Explorer")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        tickers_text = st.text_input("Ticker(s), comma separated", value="AAPL, MSFT", key="de_tks")
+    with col2:
+        period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=1, key="de_period")
+
+    if st.button("Load Local CSVs / Internet", key="de_btn"):
+        tks = _normalize_tickers(tickers_text)
+        try:
+            df = load_prices_hybrid(tks, local_dir, period=period)
+            st.success("Loaded price data")
+            st.dataframe(df.tail(10))
+            st.line_chart(df)
+            st.caption("If local CSVs are present they are preferred; otherwise Yahoo is used.")
+        except Exception as e:
+            st.error(f"Failed to load data: {e}")
+
+# =============================================================================
+# TAB 3 — RL Insights
+# =============================================================================
+with tabs[2]:
+    st.header("RL Insights")
+
+    if not (PPOAgent or DQNAgent):
+        st.warning(
+            "ppo_agent.py / dqn_agent.py missing or failed to import.\n"
+            f"Import error hint: {_AGENT_IMPORT_ERR or 'N/A'}"
+        )
+    else:
+        st.success("RL agent modules importable.")
+    st.caption("For a full demo, point the checkpoints below to real trained models.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("PPO")
+        ppo_path = Path(local_dir) / ppo_ckpt
+        if ppo_path.exists():
+            st.write(f"Found: {ppo_path}")
+            st.caption("Loading is stubbed; replace with real load/eval code in your capstone.")
+        else:
+            st.info(f"{ppo_path} not found.")
+    with c2:
+        st.subheader("DQN")
+        dqn_path = Path(local_dir) / dqn_ckpt
+        if dqn_path.exists():
+            st.write(f"Found: {dqn_path}")
+            st.caption("Loading is stubbed; replace with real load/eval code in your capstone.")
+        else:
+            st.info(f"{dqn_path} not found.")
+
+    st.markdown("---")
+    st.markdown("**Next steps for capstone integration**")
+    st.markdown(
+        "- Load checkpoints into PPOAgent/DQNAgent and compute rolling Sharpe, drawdown, and reward curves.\n"
+        "- Surface the agent’s current recommended weights for a selected universe.\n"
+        "- Feed those outputs into the Chat tab for explanation."
+    )
+
+# =============================================================================
+# TAB 4 — Stock Intelligence
+# =============================================================================
+with tabs[3]:
+    st.header("Stock Intelligence")
+    st.caption("Analyze stock trends, compute returns, and visualize performance with automatic data fetching and a naive forecast.")
+
+    tks_text = st.text_input("Ticker(s), comma separated", value="AAPL, MSFT", key="si_tks")
+    horizon = st.slider("Forecast horizon (business days)", 5, 90, 30, key="si_hor")
+
+    if st.button("Analyze Forecast", key="si_btn"):
+        tks = _normalize_tickers(tks_text)
+        errors = []
+        try:
+            df = load_prices_hybrid(tks, local_dir, period="1y")
+        except Exception as e:
+            st.error(f"Error: {e}")
+            df = None
+
+        if df is not None:
+            st.success("Data fetched successfully.")
+            st.line_chart(df)
+
+            inds = compute_basic_indicators(df)
+
+            # Show a neat metrics block per ticker
+            for tk in df.columns:
+                with st.expander(f"{tk} — summary"):
+                    s = df[tk].dropna()
+                    if len(s) < 2:
+                        st.info("Not enough data to summarize.")
+                        continue
+
+                    cur_price = float(s.iloc[-1])
+                    low, high = naive_forecast_series(s, horizon=horizon)
+                    m1 = inds["returns"][tk].tail(21).mean() * 100.0
+                    vol = inds["returns"][tk].tail(60).std() * math.sqrt(252) * 100.0  # annualized
+
+                    st.markdown(
+                        f"""
+                        - Current price: **{_fmt_money(cur_price)}**  
+                        - 1-month average daily return: **{m1:.2f}%**  
+                        - Annualized volatility (60d): **{vol:.2f}%**  
+                        - Expected price range in ~{horizon} business days: **{_fmt_money(low)} – {_fmt_money(high)}**
+                        """
+                    )
+
+            st.markdown("---")
+            st.caption("Forecast is a simple volatility-scaled band for illustration. Replace with your model of choice for the capstone.")
+
+        # Show any collected errors
+        for e in errors:
+            st.warning(e)
+
+# Footer
+st.markdown("---")
+st.caption("GenAI + RL Assistant — Capstone Dashboard. Local CSVs preferred; Yahoo used as a fallback. RL modules and checkpoints are optional to run the app.")
