@@ -1,6 +1,6 @@
 # ============================================================================
 # 05_GenAI_Explainability_Dashboard.py
-# Smart Portfolio Allocator — RL + GenAI Capstone Dashboard (Clean Version)
+# Smart Portfolio Allocator — RL + GenAI Capstone Dashboard
 # ============================================================================
 
 from __future__ import annotations
@@ -187,9 +187,52 @@ dqn_ckpt = st.sidebar.text_input("dqn_agent.pth", value="dqn_agent.pth")
 tabs = st.tabs(["Chat", "Data Explorer", "RL Insights", "Stock Intelligence"])
 
 # ----------------------------------------------------------------------------
-# Chat — Full conversational mode (ChatGPT-style)
+# Chat — FinGPT conversational interface (ChatGPT-style + fixed input + autoscroll)
 # ----------------------------------------------------------------------------
 with tabs[0]:
+    # === CSS FIXES ===
+    st.markdown(
+        """
+        <style>
+        /* Fix chat input to bottom */
+        div[data-testid="stChatInput"] {
+            position: fixed !important;
+            bottom: 0 !important;
+            left: 260px !important; /* matches sidebar width */
+            right: 0 !important;
+            background: rgba(20, 20, 20, 0.97) !important;
+            border-top: 1px solid rgba(255,255,255,0.1) !important;
+            padding: 0.75rem 1rem 1rem 1rem !important;
+            z-index: 9999 !important;
+        }
+        /* Add bottom padding so messages don’t hide behind input */
+        div.block-container {
+            padding-bottom: 120px !important;
+        }
+        /* Scrollable message area */
+        section.main {
+            overflow-y: auto !important;
+            height: 100vh !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # === Autoscroll JS injection ===
+    st.markdown(
+        """
+        <script>
+        const scrollToBottom = () => {
+            const main = window.parent.document.querySelector('.main');
+            if (main) { main.scrollTo({top: main.scrollHeight, behavior: 'smooth'}); }
+        }
+        setTimeout(scrollToBottom, 500);
+        </script>
+        """,
+        unsafe_allow_html=True
+    )
+
     st.header("AI Investing Copilot")
     st.markdown("""
     Ask portfolio-related questions such as:
@@ -199,36 +242,35 @@ with tabs[0]:
     - "Suggest allocation for $50,000"
     """)
 
-    # Initialize session chat memory
+    # === Conversation memory ===
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = [
             {"role": "assistant", "content": "Hello! I'm your AI Investing Copilot. Ask me about markets, RL strategies, or portfolio ideas."}
         ]
 
-    # Sidebar chat controls
+    # Sidebar actions
     st.sidebar.markdown("---")
     if st.sidebar.button("🆕 Start New Chat"):
         st.session_state.chat_history = [
             {"role": "assistant", "content": "New chat started. How can I help you today?"}
         ]
         st.experimental_rerun()
-
     if st.sidebar.button("🗑 Clear Conversation"):
         st.session_state.chat_history = []
         st.experimental_rerun()
 
-    # Render chat conversation
+    # === Display conversation ===
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Chat input at bottom (continuous)
+    # === Chat Input (fixed at bottom) ===
     if prompt := st.chat_input("Type your message and press Enter..."):
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Step 1 — RL context
+        # Step 1 — RL summary
         rl_summary = {
             "PPO": {"Sharpe": 1.27, "Reward_30d": 0.053},
             "DQN": {"Sharpe": 1.11, "Reward_30d": 0.041},
@@ -254,18 +296,17 @@ with tabs[0]:
         except Exception as e:
             latest = {"error": str(e)}
 
-        # Step 3 — Build conversation context
+        # Step 3 — Context assembly
         history_text = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.chat_history[-6:]])
-
         api_key = os.getenv("OPENAI_API_KEY")
         response_text = ""
 
+        # Step 4 — Generate response
         if OpenAI and api_key:
             try:
                 client = OpenAI(api_key=api_key)
                 prompt_full = f"""
-                You are FinGPT, a portfolio strategist AI combining RL (PPO/DQN)
-                insights with real market indicators.
+                You are FinGPT — a professional portfolio strategist using RL (PPO/DQN) and market data.
 
                 Conversation so far:
                 {history_text}
@@ -278,14 +319,13 @@ with tabs[0]:
                 LATEST MARKET SNAPSHOT:
                 {json.dumps(latest, indent=2)}
 
-                Respond conversationally and analytically, referencing data where relevant.
-                Include practical portfolio advice or insights where appropriate.
+                Respond conversationally, with reasoning and actionable insights.
                 """
 
                 resp = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {"role": "system", "content": "You are FinGPT, a helpful financial strategist with conversational memory."},
+                        {"role": "system", "content": "You are FinGPT, a helpful and analytical financial strategist with conversational memory."},
                         {"role": "user", "content": prompt_full},
                     ],
                     temperature=0.35,
@@ -296,33 +336,62 @@ with tabs[0]:
                 response_text = f"(LLM call failed) {e}"
         else:
             response_text = (
-                "Offline reasoning mode:\n\n"
-                "- PPO prefers stable, lower-risk assets like AAPL/MSFT.\n"
-                "- DQN targets short-term trades in NVDA/AMZN.\n"
-                "- Current RSI and SMA trends suggest mild tech bullishness.\n"
-                "- Suggested allocation: 40% AAPL, 30% NVDA, 30% MSFT."
+                "Offline mode:\n\n"
+                "- PPO favors stable, lower-risk equities (AAPL/MSFT)\n"
+                "- DQN seeks higher momentum (NVDA/AMZN)\n"
+                "- Suggested portfolio: 40% AAPL, 30% NVDA, 30% MSFT."
             )
 
-        # Display AI reply
+        # Step 5 — Display + append
         with st.chat_message("assistant"):
             st.markdown(response_text)
-
-        # Append to memory
         st.session_state.chat_history.append({"role": "assistant", "content": response_text})
 
-    # Optional edit/delete mode
-    if len(st.session_state.chat_history) > 0:
+    # === Edit/Delete Tools ===
+    if st.session_state.chat_history:
         with st.expander("📝 Edit or Delete Messages"):
+            st.markdown("You can edit or remove any message below and then click **Apply Changes**.")
+            
+            edited_messages = []
+            delete_indices = []
+
+            # Dynamically render all messages with edit + delete options
             for i, msg in enumerate(st.session_state.chat_history):
-                st.text_area(f"{msg['role'].capitalize()} #{i+1}", value=msg["content"], key=f"edit_{i}")
-            col1, col2 = st.columns(2)
-            if col1.button("Save Edits"):
-                for i in range(len(st.session_state.chat_history)):
-                    st.session_state.chat_history[i]["content"] = st.session_state[f"edit_{i}"]
-                st.success("Edits saved.")
-            if col2.button("Delete Last Message"):
-                st.session_state.chat_history.pop(-1)
-                st.experimental_rerun()
+                col1, col2 = st.columns([6, 1])
+                with col1:
+                    new_text = st.text_area(
+                        f"{msg['role'].capitalize()} #{i+1}",
+                        value=msg["content"],
+                        key=f"edit_msg_{i}",
+                    )
+                    edited_messages.append(new_text)
+                with col2:
+                    if st.button("🗑 Delete", key=f"delete_btn_{i}"):
+                        delete_indices.append(i)
+
+            # Apply updates when Save clicked
+            colA, colB = st.columns(2)
+            if colA.button("✅ Apply Changes"):
+                # Update edited messages
+                for i in range(len(edited_messages)):
+                    st.session_state.chat_history[i]["content"] = edited_messages[i]
+                st.success("All edits saved.")
+                st.rerun()
+
+            # Delete selected messages
+            if delete_indices:
+                for idx in sorted(delete_indices, reverse=True):
+                    st.session_state.chat_history.pop(idx)
+                st.warning(f"Deleted {len(delete_indices)} message(s).")
+                st.rerun()
+
+            # Optional: Clear entire chat
+            if colB.button("🧹 Clear All"):
+                st.session_state.chat_history = []
+                st.warning("All messages cleared.")
+                st.rerun()
+
+
 
 # ----------------------------------------------------------------------------
 # Data Explorer
