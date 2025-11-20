@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 # Environment and Optional Imports
 # ---------------------------------------------------------------------------
 from dotenv import load_dotenv
-load_dotenv()  # Ensure .env file is loaded at startup
+load_dotenv()  # Ensuring .env file is loaded at startup
 
 try:
     import yfinance as yf
